@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -7,10 +6,32 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-app.use(cors({ origin: '*' }));
+
+// ✅ FIX CORS for Netlify
+app.use(cors({
+  origin: 'https://qr-barcode-imei.netlify.app' // ✅ your frontend
+}));
+
 app.use(express.json({ limit: '10mb' }));
 
-// Extract and parse JSON safely
+// Gemini API helper
+async function callGeminiAPI(apiKey, payload) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Gemini API error ${res.status}: ${errorText}`);
+  }
+
+  return await res.json();
+}
+
+// JSON extraction
 function extractAndParseJson(text) {
   try {
     const start = text.indexOf('[');
@@ -18,42 +39,22 @@ function extractAndParseJson(text) {
     if (start === -1 || end === -1) throw new Error('No JSON array found');
     return JSON.parse(text.substring(start, end + 1));
   } catch (e) {
-    console.error('JSON parsing error:', e);
-    throw new Error('Malformed AI response.');
+    throw new Error('Malformed AI response: ' + e.message);
   }
 }
 
-// Call Gemini API
-async function callGeminiAPI(apiKey, payload) {
-  const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
-  const res = await fetch(URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error('Gemini error:', text);
-    throw new Error(`Gemini API failed: ${res.status}`);
-  }
-
-  return await res.json();
-}
-
-// Main endpoint
-app.post('/scan-imeis', async (req, res) => {
+// ✅ FINAL Gemini proxy route
+app.post('/gemini-proxy', async (req, res) => {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'Missing API key' });
+  const base64 = req.body.base64Image;
 
-  const imageData = req.body.base64Image;
-  if (!imageData) return res.status(400).json({ error: 'Image data missing' });
+  if (!apiKey) return res.status(500).json({ error: 'Missing Gemini API key' });
+  if (!base64) return res.status(400).json({ error: 'Missing base64 image' });
 
   const prompt = `
-From the image, extract barcode numbers that are explicitly labeled "IMEI 1". 
-Ignore all others like "IMEI 2", "S/N", "MEID". 
-Return a JSON array in this format:
-[{"imei": "123456789012345"}, {"imei": "987654321098765"}]
+From the image, extract only barcode numbers labeled "IMEI 1".
+Ignore "IMEI 2", "S/N", or anything else.
+Respond with clean JSON array like: [{"imei": "123456789012345"}, {"imei": "234567890123456"}]
 `;
 
   const payload = {
@@ -63,7 +64,7 @@ Return a JSON array in this format:
           { text: prompt },
           {
             inlineData: {
-              data: imageData,
+              data: base64,
               mimeType: 'image/jpeg'
             }
           }
@@ -74,20 +75,18 @@ Return a JSON array in this format:
 
   try {
     const result = await callGeminiAPI(apiKey, payload);
-    const text = result.candidates[0]?.content?.parts[0]?.text || '';
-    const imeiArray = extractAndParseJson(text);
-    res.json(imeiArray);
+    const rawText = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const imeis = extractAndParseJson(rawText);
+    res.json(imeis);
   } catch (err) {
-    console.error('Final error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Gemini Proxy Error:', err.message);
+    res.status(500).send(`Proxy Server Error: ${err.message}`);
   }
 });
 
-// Test route
-app.get('/', (req, res) => {
-  res.send('IMEI Gemini Backend is running.');
+app.get('/', (_, res) => {
+  res.send('Gemini Proxy is running.');
 });
 
-// Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend live on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
