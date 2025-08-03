@@ -1,99 +1,97 @@
-// Filename: index.js (Corrected)
+// Filename: index.js (or server.js)
 
-import express from 'express';
-import cors from 'cors';
-import fetch from 'node-fetch';
-import dotenv from 'dotenv';
-
-dotenv.config();
+const express = require('express');
+const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 
-// ✅ FIX: Allow requests from any origin ('*').
-// This is necessary for the app to work in development (like here) and on Netlify.
-app.use(cors({ origin: '*' }));
-
+app.use(cors({ origin: 'https://qr-barcode-imei.netlify.app' }));
 app.use(express.json({ limit: '10mb' }));
 
-// Helper function to call the Gemini API
-async function callGeminiAPI(apiKey, payload) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${errorText}`);
-  }
-
-  return await res.json();
-}
-
-// Helper function to extract JSON from the AI's text response
-function extractAndParseJson(text) {
+// Helper function to find and parse JSON from a string
+const extractAndParseJson = (text) => {
   try {
-    // This regex is more robust for finding JSON within a string that might have ```json ... ``` markers.
-    const match = text.match(/```json\s*([\s\S]*?)\s*```|(\[[\s\S]*\])/);
-    if (!match) {
-        throw new Error("No JSON array found in the string.");
+    const startIndex = text.indexOf('{');
+    const endIndex = text.lastIndexOf('}');
+    if (startIndex === -1 || endIndex === -1) {
+      throw new Error("No JSON object found in the string.");
     }
-    // Use the first captured group that is not undefined.
-    const jsonString = match[1] || match[2];
+    const jsonString = text.substring(startIndex, endIndex + 1);
     return JSON.parse(jsonString);
-  } catch (e) {
-    console.error("Malformed AI response:", text);
-    throw new Error('Malformed AI response: ' + e.message);
+  } catch (error) {
+    console.error("Failed during JSON extraction/parsing:", error);
+    throw new Error("Malformed JSON response from AI.");
   }
+};
+
+// Centralized function to call the Gemini API
+async function callGoogleApi(apiKey, payload) {
+    const GOOGLE_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+    const response = await fetch(GOOGLE_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+        const errorBody = await response.text();
+        console.error("Error from Google API:", errorBody);
+        throw new Error(`Google API responded with status ${response.status}`);
+    }
+    return response.json();
 }
 
-// The main proxy route
+
 app.post('/gemini-proxy', async (req, res) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  const base64 = req.body.base64Image;
-
-  if (!apiKey) return res.status(500).json({ error: 'Missing Gemini API key on server' });
-  if (!base64) return res.status(400).json({ error: 'Missing base64 image in request' });
-
-  const prompt = `
-From the image, extract only barcode numbers labeled "IMEI 1".
-Ignore "IMEI 2", "S/N", or anything else.
-Respond with clean JSON array like: [{"imei": "123456789012345"}, {"imei": "234567890123456"}]
-`;
-
-  const payload = {
-    contents: [
-      {
-        parts: [
-          { text: prompt },
-          {
-            inlineData: {
-              data: base64,
-              mimeType: 'image/jpeg' // Assuming jpeg, but your frontend can be more specific
-            }
-          }
-        ]
-      }
-    ]
-  };
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'API key not configured on the server.' });
+  }
 
   try {
-    const result = await callGeminiAPI(apiKey, payload);
-    const rawText = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const imeis = extractAndParseJson(rawText);
-    res.json(imeis);
-  } catch (err) {
-    console.error('Gemini Proxy Error:', err.message);
-    res.status(500).json({ error: `Proxy Server Error: ${err.message}` });
+    // --- First Attempt: Get all data ---
+    let data = await callGoogleApi(GEMINI_API_KEY, req.body);
+    let parsedJson;
+
+    if (data.candidates && data.candidates.length > 0) {
+        const textResponse = data.candidates[0].content.parts[0].text;
+        parsedJson = extractAndParseJson(textResponse);
+    } else {
+        throw new Error("AI did not provide an initial response.");
+    }
+
+    // --- Check if IMEI is missing and perform Targeted Extraction if needed ---
+    if (!parsedJson.imei) {
+        console.warn("IMEI missing. Initiating Targeted Extraction for IMEI...");
+
+        const imeiPrompt = "Analyze the attached image. Find the long numeric string next to the 'IMEI#' label. Respond with ONLY that number, nothing else.";
+        const imeiPayload = {
+            contents: [{ parts: [ { text: imeiPrompt }, req.body.contents[0].parts[1] ] }] // Re-use the image data
+        };
+
+        const imeiData = await callGoogleApi(GEMINI_API_KEY, imeiPayload);
+
+        if (imeiData.candidates && imeiData.candidates.length > 0) {
+            const imeiText = imeiData.candidates[0].content.parts[0].text;
+            // Clean up the response to get only the number
+            parsedJson.imei = imeiText.replace(/\D/g, ''); // Removes all non-digit characters
+            console.log("Successfully extracted IMEI on second attempt:", parsedJson.imei);
+        } else {
+            console.error("Targeted IMEI extraction failed to get a candidate.");
+        }
+    }
+    
+    // Return the final, potentially combined, JSON object
+    return res.json(parsedJson);
+
+  } catch (error) {
+    console.error('Proxy Server Final Error:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// A simple root route to confirm the server is running
-app.get('/', (_, res) => {
-  res.send('Gemini Proxy is running.');
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Proxy server with Targeted Extraction listening on port ${PORT}`);
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
