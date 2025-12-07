@@ -27,7 +27,7 @@ const extractAndParseJson = (text) => {
 
 // Centralized function to call the Gemini API
 async function callGoogleApi(apiKey, payload) {
-    const GOOGLE_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+    const GOOGLE_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
     const response = await fetch(GOOGLE_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
